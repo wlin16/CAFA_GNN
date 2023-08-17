@@ -1,0 +1,3 @@
+general.usage=feat_extract dataset.model_list=["esm1v"] dataset.datafile=esm1v.pt
+general.usage=feat_extract dataset.model_list=["esm1b"] dataset.datafile=esm1b.pt
+general.usage=feat_extract dataset.model_list=["esm2"] dataset.datafile=esm2.pt

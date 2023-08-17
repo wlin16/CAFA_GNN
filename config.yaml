@@ -1,0 +1,47 @@
+
+general:
+  seed: 2023
+  gpu_id: 0
+  # metrics: ["mse","r2","pcc","scc"] # reg: r2,mse,pcc,scc
+  metrics: ["mcc","auprc","cls","auroc"] # cls:auroc,auprc,cls,mcc
+  cls_threshold: 0 # set the threshold if it's a classification task
+  usage: train # train, infer
+  logits: false # false, include or only
+  input_type: mutant # mutant or twin
+  record_epoch : ${model.record_epoch}
+  save_path_log: ./result/logging.log
+  save_path_predictions: ./result/demb_perdictions_${model.batch_size}_${model.lr}.txt
+  save_path_metrics: ./result/demb_metrics_${model.batch_size}_${model.lr}.txt
+
+model:
+  batch_size: 512 # batch_size for model training
+  loss_fn: bce # bce, ce, mse
+  label_num: 1 # 1 with bce and mse, >2 with ce
+  lr: 1e-4
+  dropout: 0.1
+  early_stop: 25
+  n_epochs: 500
+  record_epoch: 56 # No.epoch to record preds during validation. Pass null if you don't wanna record preds i.e. record_epoch: null
+  model_save_path: ./result/model/esm1v_model.ckpt
+
+dataset:
+  ds_path: ./data # path where stores your dataset
+  emb_path: ./data/embeds # path to save embedding files
+  csv: MKK1_prepare.csv
+  wt_seq: MPKKKPT-P-IQLNP
+  datafile: esm1v.pt
+  # model_list: ["esm1v","esm1b","esm2"] # which model to featch embeddings
+  model_list: ["esm1v"] # which model to featch embeddings
+  batch_size_emb_gen: 1280 # batch size for generating embeddings
+
+wandb:
+  project: MKK_classifier
+  run_id: null
+  run_name: bce_esm1v_bs${model.batch_size}_${model.lr}
+
+hydra:
+  run:
+    dir: "."
+  job_logging:
+    root:
+      handlers: null

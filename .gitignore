@@ -1,0 +1,11 @@
+*.o*
+*.log
+*.pt
+
+.gitignore
+
+/data
+/wandb
+/result
+/__pycache__
+.DS_Store
