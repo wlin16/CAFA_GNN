@@ -110,11 +110,15 @@ hydra:
     hydra:
     - hydra.mode=RUN
     task:
-    - model.model_choice=gat
+    - general.input_type=concat
+    - model.model_choice=gcn
+    - model.l2=1e-2
+    - model.lrs=true
+    - general.save_num=9
   job:
     name: main
     chdir: null
-    override_dirname: model.model_choice=gat
+    override_dirname: general.input_type=concat,general.save_num=9,model.l2=1e-2,model.lrs=true,model.model_choice=gcn
     id: ???
     num: ???
     config_name: config.yaml

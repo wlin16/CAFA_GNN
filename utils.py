@@ -199,12 +199,6 @@ def calculate_f1max(batched_graph, pred, label,f1_metric):
     f1 = f1_metric(center_logits, center_labels.int())
     return f1
 
-def test_f1max(batched_graph, pred, label,f1_metric):
-    node_counts = batched_graph.batch_num_nodes().detach().cpu()
-    cumulative_node_counts = np.insert(np.cumsum(node_counts), 0, 0)
-    center_indices = cumulative_node_counts[:-1]
-    return center_indices
-
 
 def trainer(train_loader, val_loader, model, cfg, output_dim, device):
     

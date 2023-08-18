@@ -1,1 +1,5 @@
-- model.model_choice=gat
+- general.input_type=concat
+- model.model_choice=gcn
+- model.l2=1e-2
+- model.lrs=true
+- general.save_num=9

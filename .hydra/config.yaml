@@ -6,12 +6,12 @@ general:
   record_epoch: ${model.record_epoch}
   save_path_log: ./result/logging.log
   save_path_predictions: ./result/demb_perdictions_${model.batch_size}_${model.lr}.txt
-  save_path_metrics: ./result/${model.model_choice}_${general.save_num}.txt
-  save_num: 0
+  save_path_metrics: ./result/${model.model_choice}.txt
+  save_num: 9
 model:
   batch_size: 512
   loss_fn: bce
-  model_choice: gat
+  model_choice: gcn
   num_heads: 8
   label_num: 1
   lr: 0.0001
@@ -19,8 +19,8 @@ model:
   early_stop: 25
   n_epochs: 2000
   record_epoch: null
-  l2: 0
-  lrs: false
+  l2: 0.01
+  lrs: true
   model_save_path: ./result/model/${model.model_choice}_${general.save_num}.ckpt
 dataset:
   ds_path: /cath/people2/weinilin/cafa5/network
@@ -32,4 +32,4 @@ dataset:
 wandb:
   project: CAFA_GCN
   run_id: null
-  run_name: ${model.model_choice}_bs${model.batch_size}_${general.input_type}
+  run_name: ${model.model_choice}_bs${model.batch_size}_${general.input_type}_${general.save_num}

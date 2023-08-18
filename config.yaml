@@ -8,7 +8,7 @@ general:
   record_epoch : ${model.record_epoch}
   save_path_log: ./result/logging.log
   save_path_predictions: ./result/demb_perdictions_${model.batch_size}_${model.lr}.txt
-  save_path_metrics: ./result/${model.model_choice}_${general.save_num}.txt
+  save_path_metrics: ./result/${model.model_choice}.txt
   save_num: 0
 
 model:
@@ -38,7 +38,7 @@ dataset:
 wandb:
   project: CAFA_GCN
   run_id: null
-  run_name: ${model.model_choice}_bs${model.batch_size}_${general.input_type}
+  run_name: ${model.model_choice}_bs${model.batch_size}_${general.input_type}_${general.save_num}
 
 hydra:
   run:
