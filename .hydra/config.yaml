@@ -1,39 +1,35 @@
 general:
   seed: 2023
   gpu_id: 0
-  metrics:
-  - mcc
-  - auprc
-  - cls
-  - auroc
-  cls_threshold: 0
-  usage: infer
-  logits: false
-  input_type: twin
+  usage: train
+  input_type: concat
   record_epoch: ${model.record_epoch}
   save_path_log: ./result/logging.log
   save_path_predictions: ./result/demb_perdictions_${model.batch_size}_${model.lr}.txt
-  save_path_metrics: ./result/demb_metrics_${model.batch_size}_${model.lr}.txt
+  save_path_metrics: ./result/${model.model_choice}_${general.save_num}.txt
+  save_num: 0
 model:
   batch_size: 512
   loss_fn: bce
+  model_choice: gat
+  num_heads: 8
   label_num: 1
   lr: 0.0001
-  dropout: 0.1
+  dropout: 0.4
   early_stop: 25
-  n_epochs: 500
-  record_epoch: 56
-  model_save_path: ./result/model/esm1v_model.ckpt
+  n_epochs: 2000
+  record_epoch: null
+  l2: 0
+  lrs: false
+  model_save_path: ./result/model/${model.model_choice}_${general.save_num}.ckpt
 dataset:
-  ds_path: ./data
-  emb_path: ./data/embeds
-  csv: MKK1_prepare.csv
-  wt_seq: MPKKKPT-P-IQLNP
-  datafile: esm1v.pt
-  model_list:
-  - esm1v
-  batch_size_emb_gen: 1280
+  ds_path: /cath/people2/weinilin/cafa5/network
+  graph_path: /cath/people2/weinilin/cafa5/network/subgraphs_${general.input_type}
+  csv: train.csv
+  go_dict: go_dict.pkl
+  plot: 10
+  plot_out: ./subgraphs_plots
 wandb:
-  project: MKK_classifier
+  project: CAFA_GCN
   run_id: null
-  run_name: bce_esm1v_bs${model.batch_size}_${model.lr}
+  run_name: ${model.model_choice}_bs${model.batch_size}_${general.input_type}

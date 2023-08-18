@@ -110,12 +110,11 @@ hydra:
     hydra:
     - hydra.mode=RUN
     task:
-    - general.usage=infer
-    - general.input_type=twin
+    - model.model_choice=gat
   job:
     name: main
     chdir: null
-    override_dirname: general.input_type=twin,general.usage=infer
+    override_dirname: model.model_choice=gat
     id: ???
     num: ???
     config_name: config.yaml
@@ -129,18 +128,18 @@ hydra:
   runtime:
     version: 1.3.2
     version_base: '1.3'
-    cwd: /cath/homes2/weinilin/MKK_classifier
+    cwd: /cath/homes2/weinilin/CAFA_GNN
     config_sources:
     - path: hydra.conf
       schema: pkg
       provider: hydra
-    - path: /cath/homes2/weinilin/MKK_classifier
+    - path: /cath/homes2/weinilin/CAFA_GNN
       schema: file
       provider: main
     - path: ''
       schema: structured
       provider: schema
-    output_dir: /cath/homes2/weinilin/MKK_classifier
+    output_dir: /cath/homes2/weinilin/CAFA_GNN
     choices:
       hydra/env: default
       hydra/callbacks: null

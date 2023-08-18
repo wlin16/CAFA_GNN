@@ -3,10 +3,10 @@ import pandas as pd
 import re
 import os
 import sys
-from collections import Counter
+import pickle
 import logging
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
+from dgl.dataloading import GraphDataLoader
 import torch
 import wandb
 import hydra
@@ -17,17 +17,18 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-class PETaseTrain(object):
+class GNNTrain(object):
     """
-    PETase Classifier Training
+    GNN Training
     """
 
     def __init__(self, cfg: HydraConfig):
         self.seed = cfg.general.seed
         self.gpu_id = cfg.general.gpu_id
-        self.emb_path = cfg.dataset.emb_path
-        self.dataset = os.path.join(
-            self.emb_path, cfg.dataset.datafile) if cfg.dataset.datafile else None
+        self.ds_path = cfg.dataset.ds_path
+        self.csv = cfg.dataset.csv
+        self.graph_path = cfg.dataset.graph_path
+        self.go_dict = cfg.dataset.go_dict
 
         """ model parameters """
         self.batch_size = cfg.model.batch_size
@@ -36,7 +37,6 @@ class PETaseTrain(object):
 
         """ special parameters """
         self.save_path_log = cfg.general.save_path_log
-        self.logits = cfg.general.logits
         self.input_type = cfg.general.input_type
         self.label_num = cfg.model.label_num
         self.loss_fn = cfg.model.loss_fn
@@ -44,7 +44,7 @@ class PETaseTrain(object):
         self.define_logging()
         self.load_device()
 
-        if cfg.general.usage != 'feat_extract':
+        if cfg.general.usage not in ('feat_extract', 'plot'):
             self.load_data(cfg.general.usage)
             self.load_model(cfg.model)
 
@@ -113,19 +113,28 @@ class PETaseTrain(object):
         warning = f"""
         Input: Specify csv file name of 'csv' option under the dataset section in config.yaml.
             Necessary columns as following:
-                record_id: protein id or protein name as the annotation 
-                mt_seq: mutant sequence
-                mt_aa_list: mutated amino acids (list)
-                wt_aa_list: wild-type amino acids (list)
-                aa_index: mutation position index (list)
-                label: labels for each data
-
-            *** wt_seq has been set as "{config.wt_seq}" ***
+                UniProtID1: target protein name as the annotation 
+                UniProtID2: neighbour protein name as the annotation 
+                GO_terms_associated_to_UniProtID1: GO term labels for target protein (list)
+                GO_terms_associated_to_UniProtID2: GO term labels for neighbour protein (list)
         """
 
-        csv = os.path.join(config.ds_path, config.csv)
+        csv = os.path.join(self.ds_path, self.csv)
         df = pd.read_csv(csv)
-        column_names = ['record_id','mt_seq', 'mt_aa_list', 'wt_aa_list', 'aa_index']
+        go_dict = pickle.load(open(os.path.join(self.ds_path, self.go_dict), "rb"))
+        go_dict_len = len(go_dict)
+
+        if self.input_type != "concat":
+            emb = os.path.join(self.ds_path, self.input_type) + ".pt"
+            embedding = torch.load(emb)
+        else:
+            avg_dict = torch.load(self.ds_path + '/' + 'avg.pt')
+            max_dict = torch.load(self.ds_path + '/' + 'max.pt')
+            embedding = {}
+            for key in avg_dict:
+                embedding[key] = torch.cat([avg_dict[key], max_dict[key]])
+
+        column_names = ['UniProtID1','UniProtID2', 'GO_terms_associated_to_UniProtID1', 'GO_terms_associated_to_UniProtID2']
         if set(column_names) - set(df.columns): 
             raise ValueError(f'''
                              Your dataframe lacks of "{', '.join(set(column_names) - set(df.columns))}" among columns
@@ -134,27 +143,22 @@ class PETaseTrain(object):
                              {warning}
                              ''')
 
-        if 'label' not in df.columns:
+        if 'GO_terms_associated_to_UniProtID1' not in df.columns:
             print('**** The input dataframe does not contain a "label" column, \
                   here we give "-1" for all data as label to ensure the programme can run properly. ***')
-            df['label'] = -1
+            df['GO_terms_associated_to_UniProtID1'] = -1
 
         logging.warning(f'getting embeds for {csv}')
         logging.warning(f'data length: {df.shape[0]}')
 
-        for model in config.model_list:
-            logging.info(f'generating embeds from model: {model}')
-            save_embed = os.path.join(self.emb_path, f'{model}.pt')
-            os.makedirs(os.path.dirname(save_embed), exist_ok=True)
-            utils.generate_embeds_and_save(df, 
-                                           wt_seq=config.wt_seq,
-                                           save_path=save_embed,
-                                            model_selection=model,
-                                            device=self.device,
-                                            batch_size=config.batch_size_emb_gen)
+        logging.warning(f'generating embeds for: {self.input_type}')
+        os.makedirs(os.path.dirname(self.graph_path), exist_ok=True)
+        utils.build_subgraphs(df, embedding=embedding,
+                              go_dict_len=go_dict_len,
+                              save_path=self.graph_path)
 
-            logging.info(
-                f'Done! Embeds for {csv} (from {model}) has been saved as {save_embed}')
+        logging.warning(
+            f'Done! Graphs for {csv} ({self.input_type}) have been saved as {self.graph_path}')
 
     def load_data(self, usage):
         '''
@@ -164,7 +168,9 @@ class PETaseTrain(object):
 
         logging.warning(f"Loading data for the purpose of ** {usage} ** ...")
 
-        if self.dataset is None:
+        graph_num = os.path.dirname(self.graph_path)
+
+        if len(graph_num) == 0:
             raise ValueError('''
                              We cannot detect the prepared dataset (e.g. data/embeds/esm1v.pt).
                              Please:
@@ -177,79 +183,38 @@ class PETaseTrain(object):
                                     python3 main.py dataset.csv=./data/mkk.csv general.usage="feat_extract"
                              ''')
         else:
-            logging.warning(f'Loading dataset from {self.dataset}...')
-            
-        X, y, pid_list = utils.unpickler(ds_name=self.dataset, logits=self.logits, input_type=self.input_type)
+            logging.warning(f'Loading graphs from {self.graph_path}...')
+        
+
+        csv = os.path.join(self.ds_path, self.csv)
+        df = pd.read_csv(csv)
+        self.go_dict = pickle.load(open(os.path.join(self.ds_path, self.go_dict), "rb"))
+        self.go_dict_len = len(self.go_dict)
+
+        unique_proteins = df['UniProtID1'].unique().tolist()
         
         if usage == 'train':
             # Calculate weight to solve data imbalance problem
-            counter_dict = Counter(y)
-            class_counts = [y.count(i) for i in range(self.label_num)]
-            min_class_count = min(class_counts)
-            if self.label_num == 1:
-                self.weights = None
-            elif self.label_num == 2:
-                weights = counter_dict[0]/counter_dict[1] if counter_dict[0] > counter_dict[1] else counter_dict[1]/counter_dict[0]
-                # if pos data amount is larger than that of neg data amount, the value of weights should be large, otherwise small
-                # large weights value indicates the model should pay more attention to the pos data
-                self.weights = torch.tensor(weights)
-            else:
-                weights = [1.0 / (count / min(class_counts)) for count in class_counts]
-                self.weights = torch.tensor(weights)
+            train,temp = train_test_split(unique_proteins, test_size=0.4, random_state=42)
+            valid, test = train_test_split(temp, test_size=0.5, random_state=42)
 
+            logging.warning(f'X_train shape: {len(train)}')
+            logging.warning(f'X_test shape: {len(test)}')
+            logging.warning(f'X_valid shape: {(len(valid))}\n')
 
-            if self.loss_fn != "mse":
-                # Calculate weight to solve data imbalance problem
-                counter_dict = Counter(y)
-                class_counts = [y.count(i) for i in range(self.label_num)]
-                min_class_count = min(class_counts)
+            # Create DataLoader
+            self.train_loader = GraphDataLoader(utils.GraphDataset(train,self.graph_path), batch_size=self.batch_size, shuffle=True)
+            self.val_loader = GraphDataLoader(utils.GraphDataset(valid,self.graph_path), batch_size=self.batch_size, shuffle=False)
+            self.test_loader = GraphDataLoader(utils.GraphDataset(test,self.graph_path), batch_size=self.batch_size, shuffle=False)
 
-                if self.loss_fn == "bce":
-                    weights = counter_dict[0] / \
-                        counter_dict[1] if counter_dict[0] > counter_dict[1] else counter_dict[1]/counter_dict[0]
-                    self.weights = torch.tensor(weights)
-                else:
-                    weights = [1.0 / (count / min(class_counts))
-                               for count in class_counts]
-                    self.weights = torch.tensor(weights)
-            else:
-                self.weights = None
-
-            # split X and y
-            X_train, X_test, y_train, y_test, pid_train_list, pid_test_list = train_test_split(
-                X, y, pid_list, test_size=0.3, shuffle=True,
-                stratify=y, random_state=self.seed)
-
-            # split pid_list using the same random state for consistency
-            X_train, X_valid, y_train, y_valid, = train_test_split(
-                X_train, y_train,
-                test_size=0.3, shuffle=True,
-                stratify=y_train, random_state=self.seed)
-
-            self.pid_list = pid_test_list
-            self.model_dim = X_train.shape[-1]
-            logging.warning(f'X_train shape: {X_train.shape}')
-            logging.warning(f'X_test shape: {X_test.shape}')
-            logging.warning(f'X_valid shape: {X_valid.shape}\n')
-
-            train_dataset = utils.MLPDataset(X_train, y_train)
-            val_dataset = utils.MLPDataset(X_valid, y_valid)
-            test_dataset = utils.MLPDataset(X_test, y_test)
-
-            # > Feed dataset to dataloader
-            self.train_loader = DataLoader(
-                train_dataset, batch_size=self.batch_size, shuffle=True)
-            self.val_loader = DataLoader(
-                val_dataset, batch_size=self.batch_size)
-            self.test_loader = DataLoader(
-                test_dataset, batch_size=self.batch_size)
+            self.pid_list = test
 
         elif usage == 'infer':
-            logging.warning(f'dataset shape: {X.shape}')
-            dataset = utils.MLPDataset(X, y)
-            self.test_loader = DataLoader(dataset, batch_size=self.batch_size)
-            self.pid_list = pid_list
-            self.model_dim = X.shape[-1]
+            logging.warning(f'dataset shape: {len(unique_proteins)}')
+            dataset = utils.MLPDataset(unique_proteins, self.graph_path)
+            self.test_loader = GraphDataLoader(dataset, batch_size=self.batch_size)
+            self.pid_list = unique_proteins
+            self.model_dim = self.model_dim
         else:
             raise ValueError(f'''
                              usage should be one of the following:
@@ -258,18 +223,26 @@ class PETaseTrain(object):
                              ''')
 
     def load_model(self, config):
-        model_size = self.model_dim
+        model_size = 1024 if self.input_type != 'concat' else 2048
         num_hidden = int(model_size/2)
 
         logging.warning(f'model_size: {model_size}')
         logging.warning(f'num_hidden: {num_hidden}\n')
 
         logging.warning("Loading model...")
-        self.model = utils.MLPClassifier_LeakyReLu(num_input=model_size,
-        num_hidden=num_hidden,
-        num_output=config.label_num,
-        dropout=config.dropout
-        ).to(self.device)
+        if config.model_choice == 'gcn':
+            self.model = utils.GCN(num_input=model_size,
+            num_hidden=num_hidden,
+            num_output=self.go_dict_len,
+            dropout=config.dropout
+            ).to(self.device)
+        elif config.model_choice == 'gat':
+            self.model = utils.GAT(num_input=model_size,
+            num_hidden=num_hidden,
+            num_output=self.go_dict_len,
+            num_heads=config.num_heads,
+            dropout=config.dropout
+            ).to(self.device)
        
         logging.warning("Model loaded.\n")
 
@@ -294,8 +267,8 @@ class PETaseTrain(object):
         utils.trainer(self.train_loader,
                       self.val_loader,
                       self.model,
-                      self.weights,
                       train_cfg,
+                      self.go_dict_len,
                       self.device)
         wandb.finish()
 
@@ -313,30 +286,39 @@ class PETaseTrain(object):
         checkpoint = torch.load(self.model_save_path)
         self.model.load_state_dict(checkpoint['model_state_dict'])
 
-        preds, y_true = utils.predict(
-            self.test_loader, self.model, self.label_num, self.device)
+        preds, y_true = utils.predict(self.test_loader, self.model, 
+                                      self.device, config.usage)
 
-        os.makedirs(os.path.dirname(
-            config.save_path_predictions), exist_ok=True)
+        os.makedirs(os.path.dirname(config.save_path_predictions), exist_ok=True)
         os.makedirs(os.path.dirname(config.save_path_metrics), exist_ok=True)
-
+        
         utils.predict_results(y_true, preds,
-                              self.pid_list, config
-                              )
+                              name_list = self.pid_list,
+                            save_path_predictions = config.save_path_predictions,
+                            save_path_metrics = config.save_path_metrics,
+                            save_num= config.save_num,
+                            label_num =self.go_dict_len,
+                            go_dict= self.go_dict,
+                            device = self.device,
+                            usage=config.usage
+                            )
 
 
 @hydra.main(version_base=None, config_path="./", config_name="config.yaml")
 def main(cfg: HydraConfig) -> None:
 
-    PETase_classifier = PETaseTrain(cfg)
+    GNN_classifier = GNNTrain(cfg)
 
     if cfg.general.usage == 'train':
-        PETase_classifier.train(cfg)
-        PETase_classifier.evaluate(cfg.general)
+        GNN_classifier.train(cfg)
+        GNN_classifier.evaluate(cfg.general)
     elif cfg.general.usage == 'feat_extract':
-        PETase_classifier.feature_extraction(cfg.dataset)
+        GNN_classifier.feature_extraction(cfg.dataset)
+    elif cfg.general.usage == "plot":
+        utils.plot_and_save_subgraphs(cfg.dataset.graph_path, cfg.dataset.plot, 
+                                          cfg.dataset.plot_out)
     elif cfg.general.usage == 'infer':
-        PETase_classifier.evaluate(cfg.general)
+        GNN_classifier.evaluate(cfg.general)
 
 
 if __name__ == '__main__':

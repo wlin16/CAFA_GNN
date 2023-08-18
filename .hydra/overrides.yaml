@@ -1,2 +1,1 @@
-- general.usage=infer
-- general.input_type=twin
+- model.model_choice=gat

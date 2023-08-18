@@ -11,304 +11,240 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import esm
+from torchmetrics.classification import MultilabelF1Score
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from sklearn.metrics import classification_report
-from sklearn.metrics import matthews_corrcoef
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from sklearn.metrics import roc_auc_score, average_precision_score
+import dgl
+from dgl.nn.pytorch import GraphConv
+from dgl.nn import GATConv
+import networkx as nx
+import matplotlib.pyplot as plt
+
 from torch.utils.data import DataLoader, Dataset
 
 import warnings
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-### Dataset preparation part:
-class ESMDataset(Dataset):
-    def __init__(self,row):
-        super().__init__()
-        # self.seq = row[f'{datatype}_seq']
-        # self.aa = row[f'{datatype}_aa_list']
-        self.mt_seq = row['mt_seq']
-        self.mt_aa = row['mt_aa_list']
-        self.wt_aa = row['wt_aa_list']
-        self.gene_id = row['record_id']
-        self.aa_index = row['aa_index']
-        self.label = row['label']
-    def __len__(self):
-        return len(self.label)
-    def __getitem__(self, idx):
-        return (self.label[idx],self.mt_seq[idx],self.mt_aa[idx],self.wt_aa[idx], self.gene_id[idx],eval(self.aa_index[idx]))
+
+def labels_to_tensor(labels, num_classes=3000):
+    tensor = torch.zeros((1, num_classes))
+    tensor[0, labels] = 1
+    return tensor
+
+### Feature extraction part:
+def build_subgraphs(df,embedding, go_dict_len,save_path):
+
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
+    # 所有唯一的蛋白
+    unique_proteins = df['UniProtID1'].unique().tolist()
+    
+    no_neibour_protein = 0
+
+    for protein in tqdm(unique_proteins):
+        # 创建子图
+        sub_g = dgl.DGLGraph()
         
-def collate_fn(batch):
-    labels, sequences, mt_aa, wt_aa, gene_id, aa_index = zip(*batch)
-    return list(zip(labels, sequences)), wt_aa, mt_aa, gene_id, aa_index, sequences
+        # 添加中心节点
+        sub_g.add_nodes(1)
+        center_node_id = 0
+        node_mapping = {protein: center_node_id}
+        
+        # 获取与中心蛋白连接的邻居
+        neighbors = df[(df['UniProtID1'] == protein)]
+        
+        # 为中心节点分配embedding
+        center_embedding = embedding[protein]
+        sub_g.nodes[center_node_id].data['feat'] = center_embedding.unsqueeze(0)
 
-def get_logits(total_logits,aa,esm_dict):
-    softmax = nn.Softmax(dim=-1)
-    aa_id = [esm_dict[x] - 4 if x != '-' else -1 for x in eval(aa)] # -1 since the "-" is the last one in the logits matrix
-    
-    batch_aa_id = torch.arange(len(aa_id))
-    logits = softmax(total_logits)[batch_aa_id, aa_id]
-    return logits
-    
-def generate_embeds_and_save(df, wt_seq, save_path, model_selection, device, batch_size=2):
-    if model_selection =='esm1v':
-        esm_model, esm_alphabet = esm.pretrained.esm1v_t33_650M_UR90S_1()
-    elif model_selection == 'esm1b':
-        esm_model, esm_alphabet = esm.pretrained.esm1b_t33_650M_UR50S()
-    elif model_selection == 'esm2':
-        esm_model, esm_alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-    elif model_selection == "esm2_3b":
-        esm_model, esm_alphabet = esm.pretrained.esm2_t36_3B_UR50D()
-    elif model_selection == "esm2_15b":
-        esm_model, esm_alphabet = esm.pretrained.esm2_t48_15B_UR50D()
-    
-    batch_converter = esm_alphabet.get_batch_converter()
-    esm_dict = esm_alphabet.tok_to_idx
-    esm_model = esm_model.to(device) # move your model to GPU
-    
-    wt_batch_tokens = batch_converter([("protein",wt_seq)])
-    
-    mt_dataset = ESMDataset(df)
-    mt_dataloader = DataLoader(mt_dataset, batch_size=batch_size, shuffle=False,collate_fn=collate_fn, drop_last=False)
+        # Assigning label to the centre protein
+        protein_labels_center = eval(df[df['UniProtID1'] == protein]['GO_terms_associated_to_UniProtID1'].iloc[0])
+        sub_g.nodes[center_node_id].data['label'] = labels_to_tensor(protein_labels_center,num_classes = go_dict_len)
+        
+        if len(neighbors) == 0:
+            no_neibour_protein+=1
+        else:
+            # 添加邻居节点
+            for idx, (_, row) in enumerate(neighbors.iterrows()):
+                neighbor = row['UniProtID2']
 
-    final_result = {}
-    
-    for batch in tqdm(mt_dataloader,total=len(mt_dataloader)):
-        batch_labels, _, mt_batch_tokens = batch_converter(batch[0])
-        wt_aa, mt_aa, mkk_name, aa_index_list = batch[1], batch[2], batch[3], batch[4]
-
-        with torch.no_grad():
+                sub_g.add_nodes(1)
+                sub_g.add_edges(center_node_id, idx + 1)
             
-            wt_results = esm_model(wt_batch_tokens[2].to(device), repr_layers=[33]) # 1, seq_len, 1280
-            mt_results = esm_model(mt_batch_tokens.to(device), repr_layers=[33]) # batch_size, seq_len, 1280
+                node_mapping[neighbor] = idx + 1
+                edge = (center_node_id, idx + 1)
+                sub_g.edges[edge].data['weight'] = torch.tensor([row['Score']])
+                
+                # 为邻居节点分配embedding
+                neighbor_embedding = embedding[neighbor]
+                sub_g.nodes[idx + 1].data['feat'] = neighbor_embedding.unsqueeze(0)
+                
+                # Assigning label to the neighbor
+                protein_labels_neigh = eval(neighbors[neighbors['UniProtID2'] == neighbor]['GO_terms_associated_to_UniProtID2'].iloc[0])
+                sub_g.nodes[idx + 1].data['label'] = labels_to_tensor(protein_labels_neigh, num_classes = go_dict_len)
+                
+            # subgraphs.append(sub_g)
+            dgl.save_graphs(f'{save_path}/{protein}.dgl',sub_g)
             
-            for batch_idx, (aa_index, wt_list, mt_list, mkk, label) in enumerate(zip(aa_index_list, wt_aa, mt_aa, mkk_name, batch_labels)):
 
-                aa_index = torch.tensor(aa_index).to(device)
-                batch_indices = torch.arange(len(aa_index))
-                # representation's first and last token are special tokens
-                # Here the indices starts from 1, rather than 0, so we do not need to -1
-                wt_repr = wt_results["representations"][33][0, aa_index,:].mean(dim=0).detach().cpu() 
-                mt_repr = mt_results["representations"][33][batch_idx, aa_index,:].mean(dim=0).detach().cpu()
+    print(f"In total has {len(unique_proteins)}  unique proteins but {no_neibour_protein} of them are ophan")
 
-                total_logits = wt_results['logits'][0,:,list(range(4,24)) + [-3]] # batch_size, 1+seq_len+1, 20 common aa + 1 "-"
-                total_logits = total_logits[aa_index,:] # mutation_len, 21
+def plot_and_save_subgraphs(subgraphs_path, plot_number=None, path='subgraphs_plots'):
+    # Create a directory to save subgraphs
+    if not os.path.exists(path):
+        os.makedirs(path)
 
-                wt_logits = get_logits(total_logits, wt_list, esm_dict) # mutation_len
-                mt_logits = get_logits(total_logits, mt_list, esm_dict)
-                logits = torch.sum(torch.log(mt_logits/wt_logits)).detach().cpu()
-                
-                final_result[mkk] = {"wt_emb": wt_repr, "mt_emb":mt_repr, "logits":logits, 'label': label}
-
-    # save your embeddings
-    torch.save(final_result,f'{save_path}') # save the embeddings
-    del esm_model
-
-def generate_whole_embeds_and_save(df, save_path, model_selection, device, batch_size=2):
-    if model_selection =='esm1v':
-        esm_model, esm_alphabet = esm.pretrained.esm1v_t33_650M_UR90S_1()
-    elif model_selection == 'esm1b':
-        esm_model, esm_alphabet = esm.pretrained.esm1b_t33_650M_UR50S()
-    elif model_selection == 'esm2':
-        esm_model, esm_alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-    elif model_selection == "esm2_3b":
-        esm_model, esm_alphabet = esm.pretrained.esm2_t36_3B_UR50D()
-    elif model_selection == "esm2_15b":
-        esm_model, esm_alphabet = esm.pretrained.esm2_t48_15B_UR50D()
+    graph_list = [f for f in os.listdir(subgraphs_path)]
     
-    batch_converter = esm_alphabet.get_batch_converter()
-    esm_dict = esm_alphabet.tok_to_idx
-    esm_model = esm_model.to(device) # move your model to GPU
-    
-    wt_seq = "MPKKKPT-P-IQLNP"
-    wt_batch_tokens = batch_converter([("protein",wt_seq)])
-    
-    mt_dataset = ESMDataset(df)
-    mt_dataloader = DataLoader(mt_dataset, batch_size=batch_size, shuffle=False,collate_fn=collate_fn, drop_last=False)
-
-    final_result = {}
-    
-    for batch in tqdm(mt_dataloader,total=len(mt_dataloader)):
-        batch_labels, _, mt_batch_tokens = batch_converter(batch[0])
-        wt_aa, mt_aa, mkk_name, aa_index_list = batch[1], batch[2], batch[3], batch[4]
-        mt_seq = batch[5]
-        with torch.no_grad():
+    if plot_number and len(graph_list) >= plot_number:
+        import random
+        random.seed(42)
+        subgraphs = random.sample(graph_list, plot_number)
+        for graph in tqdm(subgraphs):
+            # Convert DGLGraph to NetworkX graph
+            graph_path = os.path.join(subgraphs_path,graph)
+            g,_ = dgl.load_graphs(graph_path)
+            nx_g = g[0].to_networkx().to_undirected()
             
-            wt_results = esm_model(wt_batch_tokens[2].to(device), repr_layers=[33]) # 1, seq_len, 1280
-            mt_results = esm_model(mt_batch_tokens.to(device), repr_layers=[33]) # batch_size, seq_len, 1280
-            
-            for batch_idx, (aa_index, mtseq_list, mkk, label) in enumerate(zip(aa_index_list, mt_seq, mkk_name, batch_labels)):
-
-                aa_index = torch.tensor(aa_index)
-                # batch_indices = torch.arange(len(aa_index))
-                
-                # representation's first and last token are special tokens
-                # Here the indices starts from 1, rather than 0, so we do not need to -1
-                wt_repr = wt_results["representations"][33][0,1:-1,:].detach().cpu()
-                mt_repr = mt_results["representations"][33][batch_idx,1:-1,:].detach().cpu()
-                total_logits = wt_results['logits'][0,:,list(range(4,24)) + [-3]] # batch_size, 1+seq_len+1, 20 common aa + 1 "-"
-                
-                wt_list = str(list(wt_seq))
-                mt_list = str(list(mtseq_list))
-                wt_logits = get_logits(total_logits, wt_list, esm_dict) # mutation_len
-                mt_logits = get_logits(total_logits, mt_list, esm_dict)
-                logits = torch.log(mt_logits/wt_logits).unsqueeze(1).detach().cpu()
-                
-                final_result[mkk] = {"mt_emb":mt_repr, 'logits': logits, 'aa_index': aa_index,'label': label}
-                
-    final_result['wt_emb'] = wt_repr
-
-    # save your embeddings
-    torch.save(final_result,f'{save_path}') # save the embeddings
-    del esm_model
+            # Draw using matplotlib
+            plt.figure(figsize=(8, 8))
+            pos = nx.spring_layout(nx_g)  # Layout for our graph
+            nx.draw(nx_g, pos, with_labels=True, node_color=[[.7, .7, .7]])
+            # Save the plot
+            protein_name = graph.split('.')[0]
+            plt.savefig(f"{path}/{protein_name}.png")
+            plt.close()
+            print(f"Saved: {path}/{protein_name}.png")
+    else:
+        print(f"There are only {len(graph_list)} graphs, but you asked for plotting {plot_number} graph(s). Please set a plot number smaller than {len(subgraphs)}")
 
 
-# # fetch the embeddings
-def unpickler(ds_name, input_type="mutant",logits=False):
-    # original unpickler
-    path = f'{ds_name}'
-
-    pt_embeds = torch.load(path)
-    
-    name_list = []
-    embedding_list = []
-    logits_list = []
-    label_list = []
-    for name,content in pt_embeds.items():
-        name_list.append(name)
-        logits_list.append(content['logits'])
-        label_list.append(content['label'])
-        if input_type == "mutant":
-            embedding_list.append(content['mt_emb'])
-        elif input_type == "twin":
-            embedding= torch.cat((content['wt_emb'], content['mt_emb']), dim=-1)
-            embedding_list.append(embedding)
-
-    data_X = torch.stack(embedding_list) 
-    
-    if logits is False:
-        return data_X, label_list, name_list
-    elif logits == "include":
-        logits_tensor = torch.tensor(logits_list).unsqueeze(1)
-        data_X = torch.hstack((data_X, logits_tensor))
-        return data_X, label_list, name_list
-    elif logits == "only":
-        return logits_list, label_list, name_list
 
 ###### model training part:
 # Prepare datasets for models
-class MLPDataset(Dataset):
-    def __init__(self, X, y):
-        super().__init__()
-
-        self.seq = torch.tensor(X)
-        self.label = torch.tensor(y)
+class GraphDataset(Dataset):
+    def __init__(self, protein_list,graph_path):
+        super(GraphDataset, self).__init__()
+        self.graphs = []
+        for protein in protein_list:
+            path = os.path.join(graph_path,protein) + '.dgl'
+            graph, _ = dgl.load_graphs(path)
+            self.graphs.append(graph[0])
 
     def __len__(self):
-        return len(self.seq)
-
-    def __getitem__(self, index):
-        return self.seq[index], self.label[index]
+        return len(self.graphs)
+    
+    def __getitem__(self, idx):
+        return self.graphs[idx]
 
 # model architecture setup
-class MLPClassifier_LeakyReLu(nn.Module):
-    """Simple MLP Model for Classification Tasks.
-    """
-
-    def __init__(self, num_input, num_hidden, num_output,dropout):
-        super(MLPClassifier_LeakyReLu, self).__init__()
-
-        # Instantiate an one-layer feed-forward classifier
-        self.hidden = nn.Linear(num_input, num_hidden) # 300,1280 -> 5,1280  10,1280 20,1280
-        self.predict = nn.Sequential(
-            nn.Dropout(dropout),
-            # nn.LeakyReLU(inplace=True),
-            nn.ReLU(inplace=True),
-            nn.Linear(num_hidden, int(num_hidden/2)),
-            nn.Linear(int(num_hidden/2), num_output)
-        )
-        self.softmax = nn.Softmax(dim=1) 
+class GCN(nn.Module):
+    def __init__(self, num_input, num_hidden, num_output, dropout=0.5):
+        super(GCN, self).__init__()
+        self.conv1 = GraphConv(num_input, num_hidden)
+        self.conv2 = GraphConv(num_hidden, num_hidden)
+        self.conv3 = GraphConv(num_hidden, num_output)
         
-    def forward(self, x):
-        x = self.hidden(x)
-        x = self.predict(x)
-            
+        self.dropout = nn.Dropout(p=dropout)
+    
+    def forward(self, g, features):
+        g = dgl.add_self_loop(g)
+        
+        # First convolution layer
+        x = F.relu(self.conv1(g, features.float()))
+        x = self.dropout(x)
+        
+        # Second convolution layer
+        x = F.relu(self.conv2(g, x))
+        x = self.dropout(x)
+        
+        # Third convolution layer
+        x = self.conv3(g, x)
+        
+        return x
+    
+
+class GAT(nn.Module):
+    def __init__(self, num_input, num_hidden, num_output, num_heads, dropout=0.5):
+        super(GAT, self).__init__()
+        
+        self.conv1 = GATConv(in_feats=num_input, out_feats=num_hidden, num_heads=num_heads, feat_drop=dropout, attn_drop=dropout)
+        self.conv2 = GATConv(in_feats=num_hidden * num_heads, out_feats=num_hidden, num_heads=num_heads, feat_drop=dropout, attn_drop=dropout)
+        self.conv3 = GATConv(in_feats=num_hidden * num_heads, out_feats=num_output, num_heads=1, feat_drop=dropout, attn_drop=dropout)
+        
+    def forward(self, g, features):
+        g = dgl.add_self_loop(g)
+        h = self.conv1(g, features.float())
+        x = F.elu(h.view(h.size(0), -1))
+        
+        h = self.conv2(g, x)
+        x = F.elu(h.view(h.size(0), -1))
+        
+        x = self.conv3(g, x).squeeze(1)
+        
         return x
 
 # train the model
-def flat_accuracy(pred_flat, labels):
-    equal_count = torch.sum(pred_flat == labels)
-    acc_rate = equal_count.item() / pred_flat.size(0)
-    mcc = matthews_corrcoef(labels.tolist(), pred_flat.tolist())
-    return acc_rate, mcc
+
+def calculate_f1max(batched_graph, pred, label,f1_metric):
+    node_counts = batched_graph.batch_num_nodes()
+    cumulative_node_counts = torch.cumsum(node_counts, dim=0)
+    center_indices = torch.cat([torch.tensor([0]).to(batched_graph.device), cumulative_node_counts[:-1]])
+
+    center_labels = label[center_indices]
+    center_logits = pred[center_indices]
+
+    f1 = f1_metric(center_logits, center_labels.int())
+    return f1
+
+def test_f1max(batched_graph, pred, label,f1_metric):
+    node_counts = batched_graph.batch_num_nodes().detach().cpu()
+    cumulative_node_counts = np.insert(np.cumsum(node_counts), 0, 0)
+    center_indices = cumulative_node_counts[:-1]
+    return center_indices
 
 
-def trainer(train_loader, val_loader, model, weight, cfg, device):
+def trainer(train_loader, val_loader, model, cfg, output_dim, device):
     
     early_stop=cfg.early_stop
     n_epochs = cfg.n_epochs
     lr = cfg.lr
+    l2 = cfg.l2
+    lrs=cfg.lrs
     model_save_path = cfg.model_save_path
-    label_num = int(cfg.label_num)
-    weights= weight.to(device)
+    f1_metric = MultilabelF1Score(num_labels=output_dim, average='micro').to(device)
     
-    if cfg.loss_fn == 'mse':
-        criterion = nn.MSELoss(reduction='mean')
-    elif cfg.loss_fn == 'bce':
-        criterion = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=weights) 
-    elif cfg.loss_fn == 'ce':
-        criterion = nn.CrossEntropyLoss(reduction='sum',  weight=weights)
-    else:
-        raise ValueError('loss function not supported, please choose from mse, bce or ce')
-        
+    criterion = nn.BCEWithLogitsLoss(reduction='sum')
     # Define the optimization algorithm.
-    # optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=l2)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     # scheduler = get_linear_schedule_with_warmup(optimizer,
     #                                         num_warmup_steps= 0,
     #                                         num_training_steps= len(train_loader)*n_epochs)
-
+    scheduler = CosineAnnealingLR(optimizer, T_max=20)
+    
     n_epochs, best_loss, step, early_stop_count = n_epochs, math.inf, 0, early_stop
 
     for epoch in range(n_epochs):
         model.train()  # Set the model to train mode.
         loss_record = []
-        total_train_accuracy = 0
-        total_train_mcc = 0
+        total_train_f1 = 0
         train_pbar = tqdm(train_loader, position=0, leave=True)
 
-        for batch in train_pbar:
+        for batched_graph in train_pbar:
             optimizer.zero_grad()               # Set gradient to zero.
             # Move the data to device.
-            b_seq, b_labels = (t.to(device) for t in batch)
-
-            pred = model(b_seq.float()) # b_seq  batch_size * 2560, pred batch_size * label_num
-            b_labels = b_labels.float() # b_labels batch_size * 1
-            if cfg.loss_fn == 'mse':
-                loss = criterion(pred[:,0], b_labels) # MSELoss
-                acc = (1/loss.detach().item())
-                mcc = 0
-            elif cfg.loss_fn == 'bce':
-                # b_labels_one_hot = torch.stack((b_labels, 1-b_labels), dim=1)
-                # loss = criterion(pred, b_labels_one_hot)
-                # pred_flat = torch.argmax(pred,dim=1)
-                
-                loss = criterion(pred.squeeze(), b_labels) # BCEWithLogitsLoss output dim=1
-                # loss = criterion(pred[:,0], b_labels) # BCEWithLogitsLoss or BCELoss, output dim should be 2
-                pred_flat = torch.round(torch.sigmoid(pred.squeeze())).int()
-                
-                acc, mcc = flat_accuracy(pred_flat, b_labels.long())
-            elif cfg.loss_fn == 'ce':
-                loss = criterion(pred, b_labels.long()) # CrossEntropy, output dim should be 2
-                pred_flat = torch.argmax(pred,dim=1)
-                acc, mcc = flat_accuracy(pred_flat, b_labels.long())
-                
-            total_train_accuracy += acc
-            total_train_mcc += mcc
-
+            batched_graph = batched_graph.to(device)
+            b_labels = batched_graph.ndata['label'].squeeze(1).to(device) # b_labels batch_size * 1
+            
+            pred = model(batched_graph, batched_graph.ndata['feat'].to(device))
+            loss = criterion(pred, b_labels)
+            
+            # predictions = (torch.sigmoid(pred) > 0.5)
+            f1 = calculate_f1max(batched_graph, pred, b_labels,f1_metric)
+            total_train_f1 += f1
             # Compute gradient(backpropagation).
             loss.backward()
             # nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -320,112 +256,82 @@ def trainer(train_loader, val_loader, model, weight, cfg, device):
 
             # Display current epoch number and loss on tqdm progress bar.
             train_pbar.set_description(f'Epoch [{epoch+1}/{n_epochs}]')
-            train_pbar.set_postfix({'Train loss': loss.detach().item(),'Train acc': f'{acc:.3f}'})
+            train_pbar.set_postfix({'Train loss': loss.detach().item(),'Train f1': f'{f1:.3f}'})
             
             logging.info(f'Epoch [{epoch+1}/{n_epochs}] | step [{step}] | loss: {loss.detach().item()}')
-            
-        mean_train_loss = sum(loss_record)/len(loss_record)
-        avg_train_accuracy = total_train_accuracy/len(train_loader)
-        avg_train_mcc = total_train_mcc/len(train_loader)
+
+        if lrs:
+            scheduler.step()
         
+        mean_train_loss = sum(loss_record)/len(loss_record)
+        avg_train_f1 = total_train_f1/len(train_loader)
+
         wandb.log({'epoch': epoch,
-                       'train_loss': mean_train_loss,
-                       'train_acc': avg_train_accuracy,
-                       'train_mcc': avg_train_mcc,
-                       'step': step
-                       })
+                    'train_loss': mean_train_loss,
+                    'train_f1': avg_train_f1,
+                    'step': step
+                    })
 
         ########### =========================== Evaluation=========================################
         logging.warning('###########=========================== Evaluating=========================################')
 
         model.eval()  # Set the model to evaluation mode.
         loss_record = []
-        total_eval_accuracy = 0
-        total_eval_mcc = 0
+        total_eval_f1 = 0
         preds = []
         labels = []
 
         val_pbar = tqdm(val_loader, position=0, leave=True)
-        for batch in val_pbar:
+        for batched_graph in val_pbar:
 
-            # Move your data to device.
-            b_seq, b_labels = tuple(t.to(device) for t in batch)
             with torch.no_grad():
-                pred = model(b_seq.float())
-                b_labels = b_labels.float()
+                batched_graph = batched_graph.to(device)
+                b_labels = batched_graph.ndata['label'].squeeze(1).to(device) # b_labels batch_size * 1
                 
-                if cfg.loss_fn == 'mse':
-                    loss = criterion(pred[:,0], b_labels) # MSELoss
-                    acc = (1/loss.detach().item())
-                    mcc=0
-                elif cfg.loss_fn == 'bce':
-                    # b_labels_one_hot = torch.stack((b_labels, 1-b_labels), dim=1)
-                    # loss = criterion(pred, b_labels_one_hot) # BCEWithLogitsLoss or BCELoss, output dim should be 2
-                    # pred_flat = torch.argmax(pred,dim=1)
-                    
-                    # loss = criterion(pred[:,0], b_labels) #dim=2
+                pred = model(batched_graph, batched_graph.ndata['feat'].to(device))
+                loss = criterion(pred, b_labels)
 
-                    loss = criterion(pred.squeeze(), b_labels) # BCEWithLogitsLoss output dim=1
-                    pred_flat = torch.round(torch.sigmoid(pred.squeeze())).int()
+                f1 = calculate_f1max(batched_graph, pred, b_labels,f1_metric)
+                total_eval_f1 += f1
                     
-                    acc, mcc = flat_accuracy(pred_flat, b_labels.long())
-                elif cfg.loss_fn == 'ce':
-                    loss = criterion(pred, b_labels.long()) # CrossEntropy, output dim should be 2
-                    pred_flat = torch.argmax(pred,dim=1)
-                    acc, mcc = flat_accuracy(pred_flat, b_labels.long())
-                
-                total_eval_accuracy += acc
-                total_eval_mcc += mcc
-
-                preds.extend(pred[:, 0].tolist())
-                labels.extend(b_labels.int().tolist())
+                # preds.append(pred.detach().cpu()[0].tolist())
+                # labels.append(b_labels.detach().cpu()[0].tolist())
 
             loss_record.append(loss.item())
 
             val_pbar.set_description(f'Evaluating [{epoch + 1}/{n_epochs}]')
-            val_pbar.set_postfix({'Valid loss': loss.detach().item(),'Valid acc': f'{acc:.3f}'})
+            val_pbar.set_postfix({'Valid loss': loss.detach().item(),'Valid f1': f'{f1:.3f}'})
             
             logging.info(f'Evaluating [{epoch + 1}/{n_epochs}] | step [{step}] | loss: {loss.detach().item()}')
-            
-            
-        if epoch == cfg.record_epoch:
-            # For selecting the best MCC threshold
-            threshold = pd.DataFrame({
-                    'label': labels,
-                    'prediction': preds
-                    })
-            threshold.to_csv(f"./threshold_pick_{cfg.record_epoch}.txt", sep='\t', index=False)
 
         mean_valid_loss = sum(loss_record)/len(loss_record)# 一个batch的loss
-        avg_val_accuracy = total_eval_accuracy / len(val_loader) # 一个batch的acc
-        avg_val_mcc = total_eval_mcc / len(val_loader)
-        
+        avg_val_f1 = total_eval_f1 / len(val_loader)
+
         wandb.log({'epoch': epoch, 
-                       'valid_loss': mean_valid_loss,
-                       'valid_acc': avg_val_accuracy,
-                       'valid_mcc': avg_val_mcc,
-                       'step': step
-                       })
-        
+                    'valid_loss': mean_valid_loss,
+                    'valid_f1': avg_val_f1,
+                    'step': step
+                    })
+
         logging.warning(f''' 
                         ***********************************
                         Epoch [{epoch + 1}/{n_epochs}]:
                         
                         Train loss: {mean_train_loss:.4f}, 
                         Valid loss: {mean_valid_loss:.4f}, 
-                        Train acc: {avg_train_accuracy:.4f}, 
-                        Valid acc: {avg_val_accuracy:.4f},
-                        Train mcc: {avg_train_mcc:.4f},
-                        Valid mcc: {avg_val_mcc:.4f}
+                        Train f1: {avg_train_f1:.4f},
+                        Valid f1: {avg_val_f1:.4f}
                         
                         ***********************************\n
                         ''')
+        
         if mean_valid_loss < best_loss:
             best_loss = mean_valid_loss
 
-            logging.warning('Saving model with loss {:.3f}...'.format(best_loss))
             torch.save({'model_state_dict': model.state_dict()}, 
                        f'{model_save_path}')  # Save the best model
+
+            logging.warning('Saving model with loss {:.3f}...'.format(best_loss))
 
             early_stop_count = 0
         else:
@@ -437,122 +343,66 @@ def trainer(train_loader, val_loader, model, weight, cfg, device):
             return
 
 
-def predict(test_loader, model, label_num, device):
+def predict(test_loader, model, device,usage):
     model.eval()  # Set the model to evaluation mode.
     preds = []
     labels = []
-    for batch in tqdm(test_loader):
-        b_seq, b_labels = tuple(t.to(device) for t in batch)
-        with torch.no_grad():
-            pred = model(b_seq.float())
-            if label_num == 1:
-                preds.extend(pred.squeeze().tolist())
-            else:
-                softmax = nn.Softmax()
-                # preds.extend(softmax(pred)[:,0].tolist())
-                preds.extend(pred[:,0].tolist())
-            labels.extend(b_labels.int().detach().cpu())
-    preds = torch.tensor(preds)
-    labels = torch.tensor(labels)
+    for batched_graph in tqdm(test_loader):
+        batched_graph = batched_graph.to(device)
+        b_labels = batched_graph.ndata['label'].squeeze(1).to(device) # b_labels batch_size * 1
+        pred = model(batched_graph, batched_graph.ndata['feat'].to(device))
+
+        node_counts = batched_graph.batch_num_nodes()
+        cumulative_node_counts = torch.cumsum(node_counts, dim=0)
+        center_indices = torch.cat([torch.tensor([0]).to(batched_graph.device), cumulative_node_counts[:-1]])
+
+        center_labels = b_labels[center_indices]
+        center_logits = pred[center_indices]
+
+        if usage == 'infer':
+            preds.append(torch.sigmoid(center_logits).detach().cpu())
+        else:
+            preds.append(center_logits)
+            labels.append(center_labels)
+    if usage == 'infer':
+        preds = torch.cat(preds, dim=0)
+        labels = torch.zeros(preds.shape[0])
+    else:
+        preds = torch.cat(preds, dim=0)
+        labels = torch.cat(labels, dim=0)
+
     return preds, labels
 
-class Eval(object):
-    """
-    Class for evaluation methods
-    """
-    @staticmethod
-    def metrics(metrictypes):
-        metrics_dict = {
-            "r2": r2_score,
-            "mse": mean_squared_error,
-            "pcc": pearsonr,
-            "scc": spearmanr,
-            "auroc": roc_auc_score,
-            "auprc": average_precision_score,
-            "cls": classification_report,
-            "mcc": matthews_corrcoef
-        }
-        return {metrictype: metrics_dict[metrictype] for metrictype in metrictypes if metrictype in metrics_dict}
 
-    @staticmethod
-    def calculate_scores(pred, label, metrictypes,cls_threshold):
-        pred = np.array(pred).reshape(-1)
-        label = np.array(label).reshape(-1)
-
-        metric_funcs = Eval.metrics(metrictypes)
-        scores = {}
-
-        for metrictype, func in metric_funcs.items():
-            try:
-                if metrictype in ['pcc', 'scc']:
-                    scores[metrictype] = func(label, pred)[0]
-                elif metrictype in ['cls','mcc']:
-                    label_names = {'0':0, '1':1}
-                    print("cls_threshold: ",cls_threshold)
-                    cls_pred = np.array(pred >= cls_threshold, dtype=int)
-                    if metrictype == 'cls':
-                        label_names = {'0':0, '1':1}
-                        cls_result = func(label, cls_pred, target_names=label_names)
-                        print(cls_result)
-                    else: # mcc
-                        scores[metrictype] = func(label, cls_pred)
-                else: # aucroc, aucpr
-                    scores[metrictype] = func(label, pred)
-            except:
-                scores[metrictype] = {}
-        return scores
-
-def pick_threshold(record_epoch):
-    threshold_file = f'./threshold_pick_{record_epoch}.txt'
-    
-    if os.path.exists(threshold_file):
-        df = pd.read_csv(threshold_file, sep='\t')
-        label0 = df[df['label'] == 0]['prediction']
-        label1 = df[df['label'] == 1]['prediction']
-        from scipy import stats
-        from scipy.optimize import brentq
-        kde0 = stats.gaussian_kde(label0)
-        kde1 = stats.gaussian_kde(label1)
-        intersection_point = brentq(lambda x : kde0(x) - kde1(x), df['prediction'].min(), df['prediction'].max())
+def predict_results(y_true, preds, name_list, save_path_predictions, save_path_metrics, save_num, label_num, go_dict, device, usage):
+    if usage != 'infer':
+        f1_metric = MultilabelF1Score(num_labels=label_num, average='micro').to(device)
+        f1 = f1_metric(preds, y_true.int())
+        print("F1 score: ", f1.detach().item())
         
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        sns.kdeplot(
-        data=df, x="prediction", hue="label",
-        fill=True, common_norm=False, palette="crest",
-        alpha=.5, linewidth=0,
-        )
-
-        plt.title('KDE plot of logits for ESM-1v')
-        plt.axvline(intersection_point, color='red')
-        plt.text(intersection_point-0.3, 0.05, f'x={intersection_point:.3f}', color='red', ha='right')
-        os.makedirs('./result/figure',exist_ok=True)
-        plt.savefig(f'./result/figure/KDE_ESM-1v_epoch{record_epoch}.png')
-    else:
-        intersection_point=None
+        with open(save_path_metrics,'a+') as f:
+            f.write(f"{save_num}: {f1.detach().item()}\n")
     
-    return intersection_point
+    else:
+        pred_conf_list = []
+        pred_goterms = []
+        print('Recording the predictions...')
+        for pred_value in tqdm(preds):
+            pred_bin = torch.round(pred_value).int().numpy()
+            
+            pred_indices = np.where(pred_bin == 1)[0]
+            pred_terms = [key for key, value in go_dict.items() if value in pred_indices]
+            pred_goterms.append(pred_terms)
+            
+            pred_conf = pred_value[pred_indices]
+            pred_conf_list.append(pred_conf.tolist())
+        result = pd.DataFrame({
+                'target_id': name_list,
+                'pred_go': pred_goterms,
+                'pred_pro': pred_conf_list
+            })
+        result.to_csv(save_path_predictions, sep='\t', index=False)
 
-def predict_results(y_true, preds, name_list, config):
-    intersection_point = pick_threshold(config.record_epoch)
-    if intersection_point:
-        config.cls_threshold = intersection_point
+        print(f"Predictions saved to {save_path_predictions}")
 
-    scores = Eval.calculate_scores(preds, y_true, config.metrics, config.cls_threshold)
-    for metrictype, score in scores.items():
-        logging.warning(f"{metrictype}: {score:.4f}\n")
-    # Saving the prediction results for each test data
-
-    result = pd.DataFrame({
-        'target_id': name_list,
-        'label': y_true.tolist(),
-        'prediction': preds.tolist()
-    })
-    result.to_csv(config.save_path_predictions, sep='\t', index=False)
-
-    print(f"Predictions saved to {config.save_path_predictions}")
-
-    scores = {k: float(v) if isinstance(v, np.float32)
-              else v for k, v in scores.items()}
-    json.dump(scores, open(config.save_path_metrics, "w"), indent=4, sort_keys=True)
-    print(f"Metrics saved to {config.save_path_metrics}")
+        

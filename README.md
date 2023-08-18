@@ -1,1 +1,2 @@
-# MKK_classifier
+# CAFA competition based on GCN
+

@@ -3,41 +3,42 @@ general:
   seed: 2023
   gpu_id: 0
   # metrics: ["mse","r2","pcc","scc"] # reg: r2,mse,pcc,scc
-  metrics: ["mcc","auprc","cls","auroc"] # cls:auroc,auprc,cls,mcc
-  cls_threshold: 0 # set the threshold if it's a classification task
-  usage: train # train, infer
-  logits: false # false, include or only
-  input_type: mutant # mutant or twin
+  usage: train # train, infer, feat_extract, plot
+  input_type: concat # avg or max or concat
   record_epoch : ${model.record_epoch}
   save_path_log: ./result/logging.log
   save_path_predictions: ./result/demb_perdictions_${model.batch_size}_${model.lr}.txt
-  save_path_metrics: ./result/demb_metrics_${model.batch_size}_${model.lr}.txt
+  save_path_metrics: ./result/${model.model_choice}_${general.save_num}.txt
+  save_num: 0
 
 model:
   batch_size: 512 # batch_size for model training
   loss_fn: bce # bce, ce, mse
+  model_choice: gcn # gcn or gat
+  num_heads: 8
   label_num: 1 # 1 with bce and mse, >2 with ce
   lr: 1e-4
-  dropout: 0.1
+  dropout: 0.4
   early_stop: 25
-  n_epochs: 500
-  record_epoch: 56 # No.epoch to record preds during validation. Pass null if you don't wanna record preds i.e. record_epoch: null
-  model_save_path: ./result/model/esm1v_model.ckpt
+  n_epochs: 2000
+  record_epoch: null # No.epoch to record preds during validation. Pass null if you don't wanna record preds i.e. record_epoch: null
+  l2: 0
+  lrs: false
+  model_save_path: ./result/model/${model.model_choice}_${general.save_num}.ckpt
 
 dataset:
-  ds_path: ./data # path where stores your dataset
-  emb_path: ./data/embeds # path to save embedding files
-  csv: MKK1_prepare.csv
-  wt_seq: MPKKKPT-P-IQLNP
-  datafile: esm1v.pt
+  ds_path: /cath/people2/weinilin/cafa5/network # path where stores your dataset
+  graph_path: /cath/people2/weinilin/cafa5/network/subgraphs_${general.input_type} # path to save subgraphs
+  csv: train.csv
+  go_dict: go_dict.pkl
   # model_list: ["esm1v","esm1b","esm2"] # which model to featch embeddings
-  model_list: ["esm1v"] # which model to featch embeddings
-  batch_size_emb_gen: 1280 # batch size for generating embeddings
+  plot: 10 # null or numer of plots you want
+  plot_out: ./subgraphs_plots
 
 wandb:
-  project: MKK_classifier
+  project: CAFA_GCN
   run_id: null
-  run_name: bce_esm1v_bs${model.batch_size}_${model.lr}
+  run_name: ${model.model_choice}_bs${model.batch_size}_${general.input_type}
 
 hydra:
   run:
